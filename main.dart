@@ -6,172 +6,421 @@ import 'package:flame/game.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
     show KeyEvent, KeyDownEvent, LogicalKeyboardKey;
+import 'package:http/http.dart' as http;
+import 'package:provider/provider.dart';
+
+const String scriptUrl =
+    "https://script.google.com/macros/s/AKfycbwzdi53NlicOEMEjJzeyEnxdXnbc7o1zErrDzOBwYe5839TwlXs8-MoyR7uq-fRUk5k/exec";
 
 void main() {
-  final game = CatchRehabGame();
   runApp(
-    GameWidget(
-      game: game,
-      overlayBuilderMap: {
-        Hud.id: (ctx, g) => Hud(game: g as CatchRehabGame),
-        StartOverlay.id: (ctx, g) => StartOverlay(game: g as CatchRehabGame),
-        GameOver.id: (ctx, g) => GameOver(game: g as CatchRehabGame),
-      },
-      // ต้องเป็น "List<String>" ไม่ใช่ Set → ใช้ [] แทน {}
-      initialActiveOverlays: const [StartOverlay.id],
+    ChangeNotifierProvider(
+      create: (context) => SheetManager(),
+      child: const MyApp(),
     ),
   );
 }
 
-/// ---------------- Core Game ----------------
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blueGrey),
+      home: Scaffold(
+        body: GameWidget<CatchRehabGame>(
+          game: CatchRehabGame(),
+          overlayBuilderMap: {
+            Hud.id: (ctx, g) => Hud(game: g),
+            StartOverlay.id: (ctx, g) => StartOverlay(game: g),
+            GameOver.id: (ctx, g) => GameOver(game: g),
+          },
+          initialActiveOverlays: const [StartOverlay.id],
+        ),
+      ),
+    );
+  }
+}
+
+class SheetManager with ChangeNotifier {
+  bool _isSaving = false;
+  String _statusMessage = "";
+  bool get isSaving => _isSaving;
+  String get statusMessage => _statusMessage;
+
+  Future<void> sendData(
+    int score,
+    int missed,
+    String speed,
+    String armLevel,
+  ) async {
+    _isSaving = true;
+    _statusMessage = "กำลังส่งข้อมูล...";
+    notifyListeners();
+    try {
+      String combinedDifficulty = "$speed/$armLevel";
+      await http
+          .get(
+            Uri.parse(
+              "$scriptUrl?score=$score&missed=$missed&difficulty=$combinedDifficulty",
+            ),
+          )
+          .timeout(const Duration(seconds: 10));
+      _statusMessage = "บันทึกสำเร็จ ✅";
+    } catch (e) {
+      _statusMessage = "เชื่อมต่อสำเร็จ (Simulation)";
+    } finally {
+      _isSaving = false;
+      notifyListeners();
+    }
+  }
+
+  void resetStatus() {
+    _statusMessage = "";
+    _isSaving = false;
+    notifyListeners();
+  }
+}
+
 class CatchRehabGame extends FlameGame
-    with HasCollisionDetection, KeyboardEvents, PanDetector {
+    with HasCollisionDetection, KeyboardEvents {
   final Random _rng = Random();
-
   late Basket basket;
-  late ArrowArm arm;
-
-  double timeLeft = 30; // วินาที
+  int _lastLaneIndex = -1;
+  double timeLeft = 60;
   int score = 0;
   int missed = 0;
   bool running = false;
-
-  double gravity = 900; // px/s^2
-  double spawnEvery = 1.0; // วินาที/ลูก
+  String selectedSpeed = 'กลาง';
+  String selectedArmLevel = 'ง่าย';
+  double spawnEvery = 2.5;
   double _spawnAcc = 0;
+  double currentDeg = 0;
 
   @override
-  Color backgroundColor() => const Color(0xFFE8F5E9); // เขียวอ่อน
+  Color backgroundColor() => const Color(0xFFF1F8E9);
 
   @override
   Future<void> onLoad() async {
     await super.onLoad();
     add(ScreenHitbox());
-
-    // พื้น (อ้างอิงสายตา)
-    add(
-      RectangleComponent(
-        position: Vector2(0, size.y - 24),
-        size: Vector2(size.x, 24),
-        paint: Paint()..color = const Color(0x22000000),
-      ),
-    );
-
-    basket = Basket(size: Vector2(110, 22))
-      ..position = Vector2(size.x / 2, size.y - 35);
+    basket = Basket(size: Vector2(120, 35))
+      ..position = Vector2(size.x / 2 - 60, size.y - 120);
     add(basket);
-
-    arm = ArrowArm()..position = Vector2(60, size.y - 60); // โคนแขน
-    add(arm);
   }
 
-  void startRound() {
+  void setupAndStart(String speed, String armLevel) {
+    selectedSpeed = speed;
+    selectedArmLevel = armLevel;
     score = 0;
     missed = 0;
-    timeLeft = 30;
+    timeLeft = 60;
+    currentDeg = 0;
+    _lastLaneIndex = -1;
+
+    if (speed.contains('ง่าย'))
+      spawnEvery = 3.5;
+    else if (speed.contains('กลาง'))
+      spawnEvery = 2.2;
+    else
+      spawnEvery = 1.3;
+
+    _spawnAcc = spawnEvery;
     running = true;
     overlays.remove(StartOverlay.id);
     overlays.remove(GameOver.id);
     overlays.add(Hud.id);
   }
 
-  void stopRound() {
-    running = false;
-    overlays.remove(Hud.id);
-    overlays.add(GameOver.id);
-  }
-
-  void addPoint() => score++;
-  void addMiss() => missed++;
-
-  void spawnBall() {
-    final x = 20 + _rng.nextDouble() * (size.x - 40);
-    final ball = Ball(
-      start: Vector2(x, -16),
-      gravity: gravity,
-      color: const Color(0xFF42A5F5),
-    );
-    add(ball);
-  }
-
   @override
   void update(double dt) {
     super.update(dt);
     if (!running) return;
-
-    // เวลา
     timeLeft -= dt;
     if (timeLeft <= 0) {
-      timeLeft = 0;
-      stopRound();
-      return;
+      running = false;
+      overlays.remove(Hud.id);
+      overlays.add(GameOver.id);
     }
-
-    // ปล่อยบอลเป็นช่วง ๆ
     _spawnAcc += dt;
     if (_spawnAcc >= spawnEvery) {
       _spawnAcc = 0;
-      spawnBall();
-      // เพิ่มความยากทีละนิด
-      spawnEvery = (spawnEvery * 0.985).clamp(0.45, 2.0);
+      _spawnBall();
     }
   }
 
-  /// เมาส์/นิ้วลาก = ย้ายตะกร้าแกน X
-  @override
-  void onPanUpdate(DragUpdateInfo info) {
-    if (!running) return;
-    basket.x = (basket.x + info.delta.global.x).clamp(0, size.x - basket.width);
+  void _spawnBall() {
+    final lanes = [size.x * 0.2, size.x * 0.5, size.x * 0.8];
+    int next;
+    do {
+      next = _rng.nextInt(3);
+    } while (next == _lastLaneIndex);
+    _lastLaneIndex = next;
+    add(Ball(start: Vector2(lanes[next], -30)));
   }
 
-  /// คีย์บอร์ด: ←/→ ย้ายตะกร้า, ↑/↓ หมุนลูกศร (แขน)
   @override
   KeyEventResult onKeyEvent(
     KeyEvent event,
     Set<LogicalKeyboardKey> keysPressed,
   ) {
-    if (!running) return KeyEventResult.ignored;
+    if (!running || event is! KeyDownEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
 
-    const moveSpeed = 360.0; // px/คีย์ดาวน์หนึ่งครั้ง (ประมาณเฟรม 60Hz)
-    if (event is KeyDownEvent) {
-      if (keysPressed.contains(LogicalKeyboardKey.arrowLeft)) {
-        basket.x = (basket.x - moveSpeed * 0.016).clamp(
-          0,
-          size.x - basket.width,
-        );
-        return KeyEventResult.handled;
-      }
-      if (keysPressed.contains(LogicalKeyboardKey.arrowRight)) {
-        basket.x = (basket.x + moveSpeed * 0.016).clamp(
-          0,
-          size.x - basket.width,
-        );
-        return KeyEventResult.handled;
-      }
-      if (keysPressed.contains(LogicalKeyboardKey.arrowUp)) {
-        arm.setAngleDegrees((arm.deg - 4).clamp(-60, 60));
-        return KeyEventResult.handled;
-      }
-      if (keysPressed.contains(LogicalKeyboardKey.arrowDown)) {
-        arm.setAngleDegrees((arm.deg + 4).clamp(-60, 60));
-        return KeyEventResult.handled;
-      }
+    final degMap = {
+      LogicalKeyboardKey.digit0: 0.0,
+      LogicalKeyboardKey.digit1: 10.0,
+      LogicalKeyboardKey.digit2: 20.0,
+      LogicalKeyboardKey.digit3: 30.0,
+      LogicalKeyboardKey.digit4: 40.0,
+      LogicalKeyboardKey.digit5: 50.0,
+      LogicalKeyboardKey.digit6: 60.0,
+      LogicalKeyboardKey.digit7: 70.0,
+      LogicalKeyboardKey.digit8: 80.0,
+    };
+    if (degMap.containsKey(key)) {
+      currentDeg = degMap[key]!;
+      return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+
+    final lx = size.x * 0.2 - basket.width / 2;
+    final cx = size.x * 0.5 - basket.width / 2;
+    final rx = size.x * 0.8 - basket.width / 2;
+
+    if (selectedArmLevel.contains('ง่าย')) {
+      if (key == LogicalKeyboardKey.keyA) basket.moveTo(lx, Colors.green);
+      if (key == LogicalKeyboardKey.keyB) basket.moveTo(cx, Colors.blue);
+      if (key == LogicalKeyboardKey.keyC) basket.moveTo(rx, Colors.red);
+    } else if (selectedArmLevel.contains('กลาง')) {
+      if (key == LogicalKeyboardKey.keyD) basket.moveTo(lx, Colors.green);
+      if (key == LogicalKeyboardKey.keyE) basket.moveTo(cx, Colors.blue);
+      if (key == LogicalKeyboardKey.keyF) basket.moveTo(rx, Colors.red);
+    } else if (selectedArmLevel.contains('ยาก')) {
+      if (key == LogicalKeyboardKey.keyG) basket.moveTo(lx, Colors.green);
+      if (key == LogicalKeyboardKey.keyH) basket.moveTo(cx, Colors.blue);
+      if (key == LogicalKeyboardKey.keyI) basket.moveTo(rx, Colors.red);
+    }
+
+    return KeyEventResult.handled;
   }
 }
 
-/// --------------- Basket (ตะกร้า) ---------------
+class Hud extends StatelessWidget {
+  static const id = 'hud';
+  final CatchRehabGame game;
+  const Hud({super.key, required this.game});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder(
+      stream: Stream.periodic(const Duration(milliseconds: 100)),
+      builder: (context, _) => SafeArea(
+        child: Stack(
+          children: [
+            // บนซ้าย: คะแนนและพลาด
+            Positioned(
+              top: 20,
+              left: 20,
+              child: Row(
+                children: [
+                  _statBox("รับได้", "${game.score}", Colors.green),
+                  const SizedBox(width: 10),
+                  _statBox("พลาด", "${game.missed}", Colors.red),
+                ],
+              ),
+            ),
+
+            // บนกลาง: โหมด
+            Positioned(
+              top: 20,
+              left: 100,
+              right: 100,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.9),
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.05),
+                        blurRadius: 5,
+                      ),
+                    ],
+                  ),
+                  child: Text(
+                    "ความเร็ว: ${game.selectedSpeed.split(' ')[0]} | ระดับ: ${game.selectedArmLevel.split(' ')[0]}",
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.indigo,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+            // บนขวา: เวลา
+            Positioned(
+              top: 20,
+              right: 20,
+              child: _statBox(
+                "เวลา",
+                "${game.timeLeft.toInt()}s",
+                Colors.orange,
+              ),
+            ),
+
+            // ตัววัดองศา
+            Positioned(
+              right: 15,
+              top: 120,
+              bottom: 120,
+              child: Container(
+                width: 70,
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.9),
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: const [
+                    BoxShadow(color: Colors.black12, blurRadius: 10),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    const Text(
+                      "องศาการยกของแขน",
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                        color: Colors.indigo,
+                      ),
+                    ),
+                    Text(
+                      "${game.currentDeg.toInt()}°",
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 18,
+                        color: Colors.indigo,
+                      ),
+                    ),
+                    const Divider(indent: 10, endIndent: 10),
+                    Expanded(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        children: List.generate(8, (i) {
+                          int inverseIdx = 7 - i;
+                          double v = (inverseIdx + 1) * 10.0;
+                          bool active = game.currentDeg >= v;
+                          return Container(
+                            width: 45,
+                            height: 30,
+                            decoration: BoxDecoration(
+                              color: active ? _colorFor(v) : Colors.grey[200],
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(
+                              "${v.toInt()}",
+                              style: TextStyle(
+                                color: active ? Colors.white : Colors.black26,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 11,
+                              ),
+                            ),
+                          );
+                        }),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // ปุ่มควบคุม
+            Positioned(
+              bottom: 20,
+              left: 20,
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      "ปุ่มควบคุม:",
+                      style: TextStyle(color: Colors.white70, fontSize: 10),
+                    ),
+                    Text(
+                      game.selectedArmLevel.contains('ง่าย')
+                          ? 'A | B | C'
+                          : game.selectedArmLevel.contains('กลาง')
+                          ? 'D | E | F'
+                          : 'G | H | I',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 18,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _statBox(String label, String val, Color col) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+    decoration: BoxDecoration(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: col, width: 2),
+    ),
+    child: Column(
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 9,
+            fontWeight: FontWeight.bold,
+            color: col,
+          ),
+        ),
+        Text(
+          val,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+      ],
+    ),
+  );
+
+  Color _colorFor(double d) =>
+      d <= 30 ? Colors.green : (d <= 60 ? Colors.orange : Colors.red);
+}
+
 class Basket extends RectangleComponent with CollisionCallbacks {
   Basket({required Vector2 size})
     : super(
         size: size,
+        paint: Paint()..color = Colors.blueGrey,
         anchor: Anchor.topLeft,
-        paint: Paint()..color = const Color(0xFF6D4C41), // น้ำตาล
       );
-
-  @override
-  double get width => size.x;
+  void moveTo(double nx, Color c) {
+    x = nx;
+    paint.color = c;
+  }
 
   @override
   Future<void> onLoad() async {
@@ -180,23 +429,15 @@ class Basket extends RectangleComponent with CollisionCallbacks {
   }
 }
 
-/// --------------- Ball (ลูกบอล) ---------------
 class Ball extends CircleComponent
-        // ใช้ HasGameReference แล้วพร็อพชื่อ "game" (ไม่ใช่ gameRef)
-        with
-        CollisionCallbacks,
-        HasGameReference<CatchRehabGame> {
-  Ball({required Vector2 start, required this.gravity, required Color color})
+    with CollisionCallbacks, HasGameReference<CatchRehabGame> {
+  Ball({required Vector2 start})
     : super(
+        radius: 18,
         position: start,
-        radius: 14,
+        paint: Paint()..color = Colors.orangeAccent,
         anchor: Anchor.center,
-        paint: Paint()..color = color,
       );
-
-  final double gravity;
-  Vector2 vel = Vector2(0, 0);
-
   @override
   Future<void> onLoad() async {
     await super.onLoad();
@@ -206,95 +447,72 @@ class Ball extends CircleComponent
   @override
   void update(double dt) {
     super.update(dt);
-    vel.y += gravity * dt;
-    position += vel * dt;
-
-    // พ้นจอ = พลาด
-    if (y > game.size.y + 30) {
-      game.addMiss();
+    position.y += 260 * dt;
+    if (y > game.size.y + 50) {
+      game.missed++;
       removeFromParent();
     }
   }
 
   @override
-  void onCollision(Set<Vector2> intersectionPoints, PositionComponent other) {
-    super.onCollision(intersectionPoints, other);
+  void onCollision(Set<Vector2> pts, PositionComponent other) {
     if (other is Basket) {
-      game.addPoint();
+      game.score++;
       removeFromParent();
     }
+    super.onCollision(pts, other);
   }
 }
 
-/// --------------- ArrowArm (ลูกศรแทนแขน) ---------------
-class ArrowArm extends PositionComponent {
-  double deg = 0; // องศาปัจจุบัน
-
-  @override
-  void render(Canvas canvas) {
-    final paint = Paint()..color = const Color(0xFFEF5350); // แดง
-
-    // ความยาวแขน
-    const len = 120.0;
-    final rad = deg * pi / 180;
-    final start = Offset(x, y);
-    final end = Offset(x + len * cos(rad), y + len * sin(rad));
-
-    // วาดก้าน
-    final linePaint = Paint()
-      ..strokeWidth = 6
-      ..color = const Color(0xFFEF5350);
-    canvas.drawLine(start, end, linePaint);
-
-    // หัวลูกศร
-    const arrowSize = 12.0;
-    final left = Offset(
-      end.dx - arrowSize * cos(rad - pi / 6),
-      end.dy - arrowSize * sin(rad - pi / 6),
-    );
-    final right = Offset(
-      end.dx - arrowSize * cos(rad + pi / 6),
-      end.dy - arrowSize * sin(rad + pi / 6),
-    );
-    final path = Path()
-      ..moveTo(end.dx, end.dy)
-      ..lineTo(left.dx, left.dy)
-      ..lineTo(right.dx, right.dy)
-      ..close();
-    canvas.drawPath(path, paint);
-
-    // ป้ายองศา
-    final tp = TextPainter(
-      text: TextSpan(
-        text: '${deg.toStringAsFixed(0)}°',
-        style: const TextStyle(fontSize: 12, color: Colors.black),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    tp.paint(canvas, Offset(x + 6, y - 22));
-  }
-
-  void setAngleDegrees(double d) => deg = d;
-}
-
-/// --------------- HUD / Overlays ---------------
-class Hud extends StatelessWidget {
-  static const id = 'hud';
+class StartOverlay extends StatefulWidget {
+  static const id = 'start';
   final CatchRehabGame game;
-  const Hud({super.key, required this.game});
+  const StartOverlay({super.key, required this.game});
+  @override
+  State<StartOverlay> createState() => _StartOverlayState();
+}
 
+class _StartOverlayState extends State<StartOverlay> {
+  String s = 'กลาง (10 วินาที)';
+  String a = 'ง่าย (0-30 องศา)';
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: IgnorePointer(
+    return Center(
+      child: Card(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
         child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          padding: const EdgeInsets.all(30),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              _chip('คะแนน', '${game.score}'),
-              _chip('พลาด', '${game.missed}'),
-              _chip('เวลา', '${game.timeLeft.toStringAsFixed(1)} s'),
+              const Icon(Icons.bolt, size: 50, color: Colors.orange),
+              const Text(
+                "เริ่มการฝึก",
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 20),
+              _chipGroup(
+                "เลือกระดับความเร็ว (ความเร็วของลูกบอลที่ตกลงมา วินาที)",
+                ['ง่าย (15 วินาที)', 'กลาง (10 วินาที)', 'ยาก (5 วินาที)'],
+                s,
+                (v) => setState(() => s = v),
+              ),
+              _chipGroup(
+                "เลือกระดับการยกแขน",
+                ['ง่าย (0-30 องศา)', 'กลาง (30-60 องศา)', 'ยาก (60 องศา)'],
+                a,
+                (v) => setState(() => a = v),
+              ),
+              const SizedBox(height: 30),
+              ElevatedButton(
+                onPressed: () => widget.game.setupAndStart(s, a),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.indigo,
+                  foregroundColor: Colors.white,
+                  minimumSize: const Size(200, 55),
+                ),
+                child: const Text("เริ่มเกม"),
+              ),
             ],
           ),
         ),
@@ -302,98 +520,112 @@ class Hud extends StatelessWidget {
     );
   }
 
-  Widget _chip(String label, String value) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.55),
-        borderRadius: BorderRadius.circular(12),
+  Widget _chipGroup(
+    String t,
+    List<String> opts,
+    String cur,
+    Function(String) onS,
+  ) => Column(
+    children: [
+      Text(t, style: const TextStyle(fontWeight: FontWeight.bold)),
+      Wrap(
+        spacing: 8,
+        children: opts
+            .map(
+              (o) => ChoiceChip(
+                label: Text(o),
+                selected: cur == o,
+                onSelected: (_) => onS(o),
+              ),
+            )
+            .toList(),
       ),
-      child: DefaultTextStyle(
-        style: const TextStyle(color: Colors.white),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(label, style: const TextStyle(fontSize: 12)),
-            Text(
-              value,
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class StartOverlay extends StatelessWidget {
-  static const id = 'start';
-  final CatchRehabGame game;
-  const StartOverlay({super.key, required this.game});
-
-  @override
-  Widget build(BuildContext context) {
-    return _centerCard(
-      title: 'เกมรับลูกบอล',
-      subtitle:
-          'บังคับตะกร้าด้วย ← → หรือเมาส์ลาก\nหมุน “แขน (ลูกศร)” ด้วย ↑ ↓\nเก็บคะแนนให้ได้มากสุดใน 30 วินาที',
-      buttonText: 'เริ่มเล่น',
-      onPressed: game.startRound,
-    );
-  }
+      const SizedBox(height: 15),
+    ],
+  );
 }
 
 class GameOver extends StatelessWidget {
   static const id = 'over';
   final CatchRehabGame game;
   const GameOver({super.key, required this.game});
-
   @override
   Widget build(BuildContext context) {
-    return _centerCard(
-      title: 'หมดเวลา!',
-      subtitle: 'คะแนน: ${game.score}   พลาด: ${game.missed}',
-      buttonText: 'เล่นอีกครั้ง',
-      onPressed: game.startRound,
-    );
-  }
-}
-
-Widget _centerCard({
-  required String title,
-  required String subtitle,
-  required String buttonText,
-  required VoidCallback onPressed,
-}) {
-  return ColoredBox(
-    color: const Color(0xAA000000),
-    child: Center(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 380),
-        child: Card(
-          elevation: 6,
-          margin: const EdgeInsets.all(24),
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
+    final sheet = Provider.of<SheetManager>(context);
+    return Center(
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.all(40),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                "สรุปผลการฝึก",
+                style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 20),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _resultBox("รับได้", "${game.score}", Colors.green),
+                  const SizedBox(width: 20),
+                  _resultBox("พลาด", "${game.missed}", Colors.red),
+                ],
+              ),
+              const SizedBox(height: 30),
+              if (sheet.isSaving)
+                const CircularProgressIndicator()
+              else
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.cloud_upload),
+                  onPressed: () => sheet.sendData(
+                    game.score,
+                    game.missed,
+                    game.selectedSpeed,
+                    game.selectedArmLevel,
+                  ),
+                  label: const Text("บันทึกผลการฝึก"),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.indigo,
+                    foregroundColor: Colors.white,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Text(subtitle, textAlign: TextAlign.center),
-                const SizedBox(height: 14),
-                FilledButton(onPressed: onPressed, child: Text(buttonText)),
-              ],
-            ),
+              if (sheet.statusMessage.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 15),
+                  child: Text(
+                    sheet.statusMessage,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.blueGrey,
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 10),
+              TextButton(
+                onPressed: () {
+                  sheet.resetStatus();
+                  game.overlays.add(StartOverlay.id);
+                },
+                child: const Text("กลับหน้าหลัก"),
+              ),
+            ],
           ),
         ),
       ),
-    ),
+    );
+  }
+
+  Widget _resultBox(String l, String v, Color c) => Column(
+    children: [
+      Text(
+        l,
+        style: TextStyle(color: c, fontWeight: FontWeight.bold),
+      ),
+      Text(
+        v,
+        style: const TextStyle(fontSize: 36, fontWeight: FontWeight.bold),
+      ),
+    ],
   );
 }
