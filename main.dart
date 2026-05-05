@@ -94,7 +94,7 @@ class CatchRehabGame extends FlameGame
   Basket? basket;
 
   int _lastLaneIndex = -1;
-  double timeLeft = 60; // ปรับเป็น 5 นาที (300 วินาที)
+  double timeLeft = 300; // ปรับเป็น 5 นาที (300 วินาที)
   int score = 0;
   int missed = 0;
   bool running = false;
@@ -121,7 +121,7 @@ class CatchRehabGame extends FlameGame
     selectedArmLevel = armLevel;
     score = 0;
     missed = 0;
-    timeLeft = 60; // ตั้งค่าเวลาเล่นเป็น 5 นาที
+    timeLeft = 300; // ตั้งค่าเวลาเล่นเป็น 5 นาที
     currentDeg = 0;
     _lastLaneIndex = -1;
 
@@ -175,12 +175,18 @@ class CatchRehabGame extends FlameGame
 
   void _spawnBall() {
     final lanes = [size.x * 0.2, size.x * 0.5, size.x * 0.8];
+    final laneColors = [Colors.green, Colors.blue, Colors.red];
     int next;
     do {
       next = _rng.nextInt(3);
     } while (next == _lastLaneIndex);
     _lastLaneIndex = next;
-    add(Ball(start: Vector2(lanes[next], -30)));
+    add(
+      Ball(
+        start: Vector2(lanes[next], -30),
+        ballColor: laneColors[next], // เพิ่มการส่งค่าสี
+      ),
+    );
   }
 
   @override
@@ -666,11 +672,13 @@ class Basket extends PositionComponent with CollisionCallbacks {
 // --- ลูกบอล ---
 class Ball extends CircleComponent
     with CollisionCallbacks, HasGameReference<CatchRehabGame> {
-  Ball({required Vector2 start})
+  final Color ballColor;
+  Ball({required Vector2 start, required this.ballColor})
     : super(
         radius: 25,
         position: start,
-        paint: Paint()..color = Colors.orangeAccent,
+        // ใช้สีที่รับมาจากตอน spawn
+        paint: Paint()..color = ballColor,
         anchor: Anchor.center,
       );
   @override
